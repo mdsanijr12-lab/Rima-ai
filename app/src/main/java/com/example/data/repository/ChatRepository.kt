@@ -128,8 +128,9 @@ class ChatRepository(
         chatMessageDao.insertMessage(userMessage)
         conversationDao.touchConversation(conversationId)
 
-        // 3. Build Conversation History for multi-turn context (last 12 messages)
+        // 3. Build Conversation History for multi-turn context (excluding error messages, last 12 turns)
         val historyMessages = chatMessageDao.getMessagesListForConversation(conversationId)
+            .filter { !it.isError || it.id == userMessageId }
         val contextTurnMessages = if (historyMessages.size > 12) {
             historyMessages.takeLast(12)
         } else {
@@ -183,80 +184,102 @@ class ChatRepository(
             systemInstruction = systemInstruction
         )
 
-        // 5. Call API
-        try {
-            if (apiKey.isBlank() || apiKey == "MY_GEMINI_API_KEY") {
-                val simulatedAnswer = generateOfflineFallback(userPrompt, detectedLang)
-                val aiMsg = ChatMessageEntity(
-                    id = UUID.randomUUID().toString(),
-                    conversationId = conversationId,
-                    role = "model",
-                    content = simulatedAnswer,
-                    timestamp = System.currentTimeMillis(),
-                    isError = false,
-                    modelName = AvailableModels.find(modelId).name,
-                    language = langCode
-                )
-                chatMessageDao.insertMessage(aiMsg)
-                autoRenameFirstTurn(conversationId, userPrompt)
-                return@withContext Result.success(aiMsg)
-            }
-
-            val response = GeminiApiClient.service.generateContent(
-                model = modelId,
-                apiKey = apiKey,
-                request = request
-            )
-
-            if (response.isSuccessful && response.body() != null) {
-                val body = response.body()!!
-                val rawAnswer = body.candidates?.firstOrNull()?.content?.parts?.firstOrNull()?.text
-                    ?: "I received your request, but could not generate a response text. Please try again."
-
-                val aiMsg = ChatMessageEntity(
-                    id = UUID.randomUUID().toString(),
-                    conversationId = conversationId,
-                    role = "model",
-                    content = rawAnswer,
-                    timestamp = System.currentTimeMillis(),
-                    isError = false,
-                    modelName = AvailableModels.find(modelId).name,
-                    language = langCode
-                )
-                chatMessageDao.insertMessage(aiMsg)
-                autoRenameFirstTurn(conversationId, userPrompt)
-                Result.success(aiMsg)
-            } else {
-                val errorBody = response.errorBody()?.string() ?: "HTTP ${response.code()}"
-                val friendlyError = formatApiError(response.code(), errorBody)
-                val errorMsg = ChatMessageEntity(
-                    id = UUID.randomUUID().toString(),
-                    conversationId = conversationId,
-                    role = "model",
-                    content = friendlyError,
-                    timestamp = System.currentTimeMillis(),
-                    isError = true,
-                    modelName = AvailableModels.find(modelId).name,
-                    language = langCode
-                )
-                chatMessageDao.insertMessage(errorMsg)
-                Result.failure(Exception(friendlyError))
-            }
-        } catch (e: Exception) {
-            val friendlyError = "Connection Error: ${e.localizedMessage ?: "Unable to connect to Rima AI servers. Please check your internet connection and retry."}"
+        // 5. Call Real Gemini API with retries and robust error handling
+        if (apiKey.isBlank()) {
+            val missingKeyError = "Gemini API key is not configured. Please ensure the GEMINI_API_KEY secret is configured in AI Studio Secrets or enter an API key in Settings."
             val errorMsg = ChatMessageEntity(
                 id = UUID.randomUUID().toString(),
                 conversationId = conversationId,
                 role = "model",
-                content = friendlyError,
+                content = missingKeyError,
                 timestamp = System.currentTimeMillis(),
                 isError = true,
                 modelName = AvailableModels.find(modelId).name,
                 language = langCode
             )
             chatMessageDao.insertMessage(errorMsg)
-            Result.failure(e)
+            return@withContext Result.failure(Exception(missingKeyError))
         }
+
+        var lastException: Exception? = null
+        val maxAttempts = 3
+
+        for (attempt in 1..maxAttempts) {
+            try {
+                val response = GeminiApiClient.service.generateContent(
+                    model = modelId,
+                    apiKey = apiKey,
+                    request = request
+                )
+
+                if (response.isSuccessful && response.body() != null) {
+                    val body = response.body()!!
+                    val rawAnswer = body.candidates?.firstOrNull()?.content?.parts?.firstOrNull()?.text
+                        ?: "I received your request, but could not generate a response text. Please try again."
+
+                    val aiMsg = ChatMessageEntity(
+                        id = UUID.randomUUID().toString(),
+                        conversationId = conversationId,
+                        role = "model",
+                        content = rawAnswer,
+                        timestamp = System.currentTimeMillis(),
+                        isError = false,
+                        modelName = AvailableModels.find(modelId).name,
+                        language = langCode
+                    )
+                    chatMessageDao.insertMessage(aiMsg)
+                    autoRenameFirstTurn(conversationId, userPrompt)
+                    return@withContext Result.success(aiMsg)
+                } else {
+                    val statusCode = response.code()
+                    val errorBody = response.errorBody()?.string() ?: "HTTP $statusCode"
+
+                    // If transient server error (429, 500, 503), retry
+                    if ((statusCode == 429 || statusCode == 500 || statusCode == 503) && attempt < maxAttempts) {
+                        kotlinx.coroutines.delay(1000L * attempt)
+                        continue
+                    }
+
+                    val friendlyError = formatApiError(statusCode, errorBody)
+                    val errorMsg = ChatMessageEntity(
+                        id = UUID.randomUUID().toString(),
+                        conversationId = conversationId,
+                        role = "model",
+                        content = friendlyError,
+                        timestamp = System.currentTimeMillis(),
+                        isError = true,
+                        modelName = AvailableModels.find(modelId).name,
+                        language = langCode
+                    )
+                    chatMessageDao.insertMessage(errorMsg)
+                    return@withContext Result.failure(Exception(friendlyError))
+                }
+            } catch (e: Exception) {
+                lastException = e
+                if (attempt < maxAttempts) {
+                    kotlinx.coroutines.delay(1000L * attempt)
+                }
+            }
+        }
+
+        val errorText = when (lastException) {
+            is java.net.SocketTimeoutException -> "Request Timeout: The AI model took too long to respond. Please check your network connection and retry."
+            is java.net.UnknownHostException -> "Network Unavailable: Unable to connect to the Gemini API servers. Please check your internet connection."
+            else -> "Connection Error: ${lastException?.localizedMessage ?: "Unable to complete request to Gemini API. Please try again."}"
+        }
+
+        val errorMsg = ChatMessageEntity(
+            id = UUID.randomUUID().toString(),
+            conversationId = conversationId,
+            role = "model",
+            content = errorText,
+            timestamp = System.currentTimeMillis(),
+            isError = true,
+            modelName = AvailableModels.find(modelId).name,
+            language = langCode
+        )
+        chatMessageDao.insertMessage(errorMsg)
+        Result.failure(lastException ?: Exception(errorText))
     }
 
     private suspend fun autoRenameFirstTurn(conversationId: String, userPrompt: String) {
@@ -310,51 +333,10 @@ class ChatRepository(
     private fun formatApiError(code: Int, rawBody: String): String {
         return when (code) {
             400 -> "Invalid Request (400): Please check your query or attachments and try again."
-            401, 403 -> "Authentication Error ($code): Please check your API key in Settings."
+            401, 403 -> "Authentication Error ($code): Please check your API key in Settings or AI Studio Secrets."
             429 -> "Rate Limit Exceeded (429): You have sent too many requests. Please wait a moment and try again."
             500, 503 -> "Server Unavailable ($code): The AI provider is temporarily busy. Please try again shortly."
             else -> "Error ($code): An issue occurred while contacting Rima AI. Please retry."
-        }
-    }
-
-    private fun generateOfflineFallback(prompt: String, lang: DetectedLanguage): String {
-        return when (lang) {
-            DetectedLanguage.BENGALI -> """
-                ## রিমা এআই (Rima AI) এ স্বাগতম!
-                
-                আমি আপনার ব্যক্তিগত এআই সহকারী। আমি সাধারণ জ্ঞান, বিজ্ঞান, প্রোগ্রামিং, অনুবাদ, গণিত এবং দৈনন্দিন যেকোনো প্রশ্নের উত্তর দিতে প্রস্তুত।
-                
-                **আপনার প্রশ্ন:**
-                > "$prompt"
-                
-                *নোট: সরাসরি লাইভ এআই সার্ভার অ্যাক্সেস করতে অনুগ্রহ করে Settings থেকে একটি সক্রিয় Gemini API Key যুক্ত করুন অথবা AI Studio Secrets সক্রিয় করুন।*
-            """.trimIndent()
-            DetectedLanguage.BANGLISH -> """
-                ## Rima AI te shagotom!
-                
-                Ami apnar intelligent AI assistant. Apnar proshno:
-                > "$prompt"
-                
-                Ami Bangla, English ebong Banglish shob language e help korte pari!
-                
-                *Note: Live AI server call korar jonno Settings theke Gemini API Key check korun.*
-            """.trimIndent()
-            DetectedLanguage.ENGLISH -> """
-                ## Welcome to Rima AI!
-                
-                I am Rima AI, your intelligent assistant.
-                
-                **Your query:**
-                > "$prompt"
-                
-                I am ready to help you with:
-                - **General Knowledge & Science**
-                - **Coding & Technical Problem Solving**
-                - **Multilingual Translations (Bengali / English)**
-                - **Math & Step-by-Step Explanations**
-                
-                *Tip: Set your Gemini API Key in Settings or AI Studio Secrets to enable live real-time model answers.*
-            """.trimIndent()
         }
     }
 

@@ -60,27 +60,43 @@ object LanguageDetectorUtil {
     data class TtsSegment(val text: String, val isBengali: Boolean)
 
     fun splitIntoTtsSegments(fullText: String): List<TtsSegment> {
-        // Clean markdown symbols first for speech
+        if (fullText.isBlank()) return emptyList()
+
+        // Clean markdown symbols, code blocks, and urls for natural spoken audio
         val cleanText = fullText
-            .replace(Regex("```[a-zA-Z]*\\n[\\s\\S]*?```"), " [Code block skipped] ")
+            // Remove code blocks completely from speech output
+            .replace(Regex("```[\\s\\S]*?```"), " ")
+            // Remove inline code ticks
             .replace(Regex("`([^`]+)`"), "$1")
-            .replace(Regex("[#*_~>\\[\\]]"), " ")
-            .replace(Regex("\\s+"), " ")
+            // Remove markdown links [text](url) -> text
+            .replace(Regex("\\[([^\\]]+)\\]\\([^\\)]+\\)"), "$1")
+            // Remove headers #, ##, ###
+            .replace(Regex("(?m)^#+\\s*"), "")
+            // Remove bullet points *, -, •
+            .replace(Regex("(?m)^[\\*\\-\\•\\+]\\s*"), "")
+            // Remove markdown formatting like bold/italics
+            .replace(Regex("[\\*\\_~]"), "")
+            // Remove blockquote markers >
+            .replace(Regex("(?m)^>\\s*"), "")
+            // Replace table pipes
+            .replace(Regex("\\|"), " ")
+            // Normalize spaces
+            .replace(Regex("[ \\t]+"), " ")
             .trim()
 
         if (cleanText.isBlank()) return emptyList()
 
         // Split by sentences (handling Bengali danda '।' and standard '.', '?', '!', '\n')
         val sentenceDelimiters = Regex("([।\\.\\?\\!\\n]+)")
-        val tokens = cleanText.split(sentenceDelimiters).map { it.trim() }.filter { it.isNotBlank() }
+        val rawTokens = cleanText.split(sentenceDelimiters).map { it.trim() }.filter { it.isNotBlank() }
 
-        if (tokens.isEmpty()) {
+        if (rawTokens.isEmpty()) {
             val isBn = cleanText.any { it.toString().matches(bengaliCharRegex) }
             return listOf(TtsSegment(cleanText, isBn))
         }
 
         val segments = mutableListOf<TtsSegment>()
-        for (token in tokens) {
+        for (token in rawTokens) {
             val hasBengali = token.any { it.toString().matches(bengaliCharRegex) }
             segments.add(TtsSegment(token, hasBengali))
         }
