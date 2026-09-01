@@ -1,0 +1,6 @@
+{
+  "name": "Rima AI",
+  "description": "Modern, intelligent AI assistant with multilingual chat, voice text-to-speech, vision, and custom Rima branding.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

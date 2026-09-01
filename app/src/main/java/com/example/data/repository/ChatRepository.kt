@@ -1,0 +1,396 @@
+package com.example.data.repository
+
+import android.content.Context
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
+import android.net.Uri
+import android.util.Base64
+import com.example.BuildConfig
+import com.example.data.local.RimaDatabase
+import com.example.data.local.entity.ChatMessageEntity
+import com.example.data.local.entity.ConversationEntity
+import com.example.data.model.AvailableModels
+import com.example.data.model.ResponseLengthMode
+import com.example.data.model.SettingsManager
+import com.example.data.remote.CandidateDto
+import com.example.data.remote.ContentDto
+import com.example.data.remote.GeminiApiClient
+import com.example.data.remote.GenerateContentRequest
+import com.example.data.remote.GenerationConfigDto
+import com.example.data.remote.InlineDataDto
+import com.example.data.remote.PartDto
+import com.example.util.DetectedLanguage
+import com.example.util.LanguageDetectorUtil
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.withContext
+import java.io.ByteArrayOutputStream
+import java.io.InputStream
+import java.util.UUID
+
+class ChatRepository(
+    private val context: Context,
+    private val database: RimaDatabase,
+    private val settingsManager: SettingsManager
+) {
+    private val conversationDao = database.conversationDao()
+    private val chatMessageDao = database.chatMessageDao()
+
+    fun getAllConversations(): Flow<List<ConversationEntity>> =
+        conversationDao.getAllConversations()
+
+    fun searchConversations(query: String): Flow<List<ConversationEntity>> =
+        conversationDao.searchConversations(query)
+
+    fun getMessagesForConversation(conversationId: String): Flow<List<ChatMessageEntity>> =
+        chatMessageDao.getMessagesForConversation(conversationId)
+
+    suspend fun createNewConversation(
+        title: String = "New Chat",
+        modelId: String = settingsManager.settings.value.selectedModelId
+    ): ConversationEntity = withContext(Dispatchers.IO) {
+        val newConv = ConversationEntity(
+            id = UUID.randomUUID().toString(),
+            title = title,
+            createdAt = System.currentTimeMillis(),
+            updatedAt = System.currentTimeMillis(),
+            modelId = modelId,
+            isPinned = false
+        )
+        conversationDao.insertConversation(newConv)
+        newConv
+    }
+
+    suspend fun getConversationById(id: String): ConversationEntity? = withContext(Dispatchers.IO) {
+        conversationDao.getConversationById(id)
+    }
+
+    suspend fun renameConversation(id: String, newTitle: String) = withContext(Dispatchers.IO) {
+        conversationDao.renameConversation(id, newTitle)
+    }
+
+    suspend fun togglePinConversation(id: String, isPinned: Boolean) = withContext(Dispatchers.IO) {
+        conversationDao.setPinned(id, isPinned)
+    }
+
+    suspend fun deleteConversation(id: String) = withContext(Dispatchers.IO) {
+        chatMessageDao.deleteMessagesForConversation(id)
+        conversationDao.deleteConversation(id)
+    }
+
+    suspend fun clearAll() = withContext(Dispatchers.IO) {
+        chatMessageDao.clearAllMessages()
+        conversationDao.clearAllConversations()
+    }
+
+    suspend fun deleteMessage(id: String) = withContext(Dispatchers.IO) {
+        chatMessageDao.deleteMessage(id)
+    }
+
+    /**
+     * Sends user message to Gemini and returns the saved AI response entity.
+     */
+    suspend fun sendMessage(
+        conversationId: String,
+        userPrompt: String,
+        imageUri: Uri? = null,
+        documentName: String? = null,
+        documentContent: String? = null,
+        overrideModelId: String? = null
+    ): Result<ChatMessageEntity> = withContext(Dispatchers.IO) {
+        val settings = settingsManager.settings.value
+        val modelId = overrideModelId ?: settings.selectedModelId
+        val apiKey = settings.customApiKey.ifBlank { BuildConfig.GEMINI_API_KEY }
+
+        // 1. Detect language of the input
+        val detectedLang = LanguageDetectorUtil.detectLanguage(userPrompt)
+        val langCode = when (detectedLang) {
+            DetectedLanguage.BENGALI -> "bn"
+            DetectedLanguage.BANGLISH -> "banglish"
+            DetectedLanguage.ENGLISH -> "en"
+        }
+
+        // 2. Insert User Message into Room
+        val userMessageId = UUID.randomUUID().toString()
+        val userMessage = ChatMessageEntity(
+            id = userMessageId,
+            conversationId = conversationId,
+            role = "user",
+            content = userPrompt,
+            imageUri = imageUri?.toString(),
+            attachmentName = documentName,
+            attachmentType = if (imageUri != null) "image" else if (documentName != null) "document" else null,
+            timestamp = System.currentTimeMillis(),
+            isError = false,
+            modelName = AvailableModels.find(modelId).name,
+            language = langCode
+        )
+        chatMessageDao.insertMessage(userMessage)
+        conversationDao.touchConversation(conversationId)
+
+        // 3. Build Conversation History for multi-turn context (last 12 messages)
+        val historyMessages = chatMessageDao.getMessagesListForConversation(conversationId)
+        val contextTurnMessages = if (historyMessages.size > 12) {
+            historyMessages.takeLast(12)
+        } else {
+            historyMessages
+        }
+
+        // Build contents list
+        val contentsList = mutableListOf<ContentDto>()
+        for (msg in contextTurnMessages) {
+            val parts = mutableListOf<PartDto>()
+
+            // If message is the current turn and has image, encode base64
+            if (msg.id == userMessageId && imageUri != null) {
+                val base64Data = encodeUriToBase64(imageUri)
+                if (base64Data != null) {
+                    parts.add(PartDto(inlineData = InlineDataDto(mimeType = "image/jpeg", data = base64Data)))
+                }
+            }
+
+            var textPayload = msg.content
+            if (msg.id == userMessageId && documentContent != null) {
+                textPayload = "Attached File Content (${documentName ?: "document"}):\n\"\"\"\n$documentContent\n\"\"\"\n\nUser Question:\n$textPayload"
+            }
+
+            parts.add(PartDto(text = textPayload))
+
+            val apiRole = if (msg.role == "user") "user" else "model"
+            contentsList.add(ContentDto(role = apiRole, parts = parts))
+        }
+
+        // 4. Build System Instruction for Rima AI
+        val systemInstructionText = buildSystemPrompt(settings.responseLength, settings.customInstructions, detectedLang)
+        val systemInstruction = ContentDto(
+            parts = listOf(PartDto(text = systemInstructionText))
+        )
+
+        val generationConfig = GenerationConfigDto(
+            temperature = 0.7f,
+            topP = 0.95f,
+            topK = 40,
+            maxOutputTokens = when (settings.responseLength) {
+                ResponseLengthMode.SHORT -> 512
+                ResponseLengthMode.NORMAL -> 2048
+                ResponseLengthMode.DETAILED -> 4096
+            }
+        )
+
+        val request = GenerateContentRequest(
+            contents = contentsList,
+            generationConfig = generationConfig,
+            systemInstruction = systemInstruction
+        )
+
+        // 5. Call API
+        try {
+            if (apiKey.isBlank() || apiKey == "MY_GEMINI_API_KEY") {
+                val simulatedAnswer = generateOfflineFallback(userPrompt, detectedLang)
+                val aiMsg = ChatMessageEntity(
+                    id = UUID.randomUUID().toString(),
+                    conversationId = conversationId,
+                    role = "model",
+                    content = simulatedAnswer,
+                    timestamp = System.currentTimeMillis(),
+                    isError = false,
+                    modelName = AvailableModels.find(modelId).name,
+                    language = langCode
+                )
+                chatMessageDao.insertMessage(aiMsg)
+                autoRenameFirstTurn(conversationId, userPrompt)
+                return@withContext Result.success(aiMsg)
+            }
+
+            val response = GeminiApiClient.service.generateContent(
+                model = modelId,
+                apiKey = apiKey,
+                request = request
+            )
+
+            if (response.isSuccessful && response.body() != null) {
+                val body = response.body()!!
+                val rawAnswer = body.candidates?.firstOrNull()?.content?.parts?.firstOrNull()?.text
+                    ?: "I received your request, but could not generate a response text. Please try again."
+
+                val aiMsg = ChatMessageEntity(
+                    id = UUID.randomUUID().toString(),
+                    conversationId = conversationId,
+                    role = "model",
+                    content = rawAnswer,
+                    timestamp = System.currentTimeMillis(),
+                    isError = false,
+                    modelName = AvailableModels.find(modelId).name,
+                    language = langCode
+                )
+                chatMessageDao.insertMessage(aiMsg)
+                autoRenameFirstTurn(conversationId, userPrompt)
+                Result.success(aiMsg)
+            } else {
+                val errorBody = response.errorBody()?.string() ?: "HTTP ${response.code()}"
+                val friendlyError = formatApiError(response.code(), errorBody)
+                val errorMsg = ChatMessageEntity(
+                    id = UUID.randomUUID().toString(),
+                    conversationId = conversationId,
+                    role = "model",
+                    content = friendlyError,
+                    timestamp = System.currentTimeMillis(),
+                    isError = true,
+                    modelName = AvailableModels.find(modelId).name,
+                    language = langCode
+                )
+                chatMessageDao.insertMessage(errorMsg)
+                Result.failure(Exception(friendlyError))
+            }
+        } catch (e: Exception) {
+            val friendlyError = "Connection Error: ${e.localizedMessage ?: "Unable to connect to Rima AI servers. Please check your internet connection and retry."}"
+            val errorMsg = ChatMessageEntity(
+                id = UUID.randomUUID().toString(),
+                conversationId = conversationId,
+                role = "model",
+                content = friendlyError,
+                timestamp = System.currentTimeMillis(),
+                isError = true,
+                modelName = AvailableModels.find(modelId).name,
+                language = langCode
+            )
+            chatMessageDao.insertMessage(errorMsg)
+            Result.failure(e)
+        }
+    }
+
+    private suspend fun autoRenameFirstTurn(conversationId: String, userPrompt: String) {
+        val conv = conversationDao.getConversationById(conversationId)
+        if (conv != null && (conv.title == "New Chat" || conv.title.isBlank())) {
+            val words = userPrompt.trim().split("\\s+".toRegex())
+            val summaryTitle = if (words.size <= 5) {
+                userPrompt.trim().take(36)
+            } else {
+                words.take(5).joinToString(" ").take(36) + "..."
+            }
+            conversationDao.renameConversation(conversationId, summaryTitle)
+        }
+    }
+
+    private fun buildSystemPrompt(
+        length: ResponseLengthMode,
+        customInstructions: String,
+        detectedLang: DetectedLanguage
+    ): String {
+        val lengthInstruction = when (length) {
+            ResponseLengthMode.SHORT -> "Keep your responses concise, straight to the point, and direct."
+            ResponseLengthMode.NORMAL -> "Provide balanced, well-structured, clear explanations with appropriate detail."
+            ResponseLengthMode.DETAILED -> "Provide comprehensive, deeply detailed, step-by-step answers with thorough explanations and examples."
+        }
+
+        return """
+            You are Rima AI, an intelligent, friendly, modern, and empathetic personal AI assistant.
+            Tagline: "Ask Anything. Get Intelligent Answers."
+            
+            Core Guidelines:
+            1. Multilingual Fluency:
+               - If the user writes in Bengali (বাংলা), reply in natural, grammatically correct, pleasant Bengali.
+               - If the user writes in Banglish (Bengali transliterated in English script like 'kemon acho', 'amake help koro'), understand it fluently and respond warmly in natural Bengali (or Banglish if specifically requested).
+               - If the user writes in English, reply in clear, professional English.
+               - If the user uses a mixture of Bengali and English, converse seamlessly with bilingual context.
+            2. Formatting:
+               - Use Markdown headings (##, ###), bullet lists (•), numbered lists (1., 2.), bold text (**term**), and structured sections.
+               - For programming and coding, always use formatted code blocks with the exact language name (e.g. ```kotlin, ```python).
+               - Use tables where comparative data is useful.
+               - Render math calculations cleanly.
+            3. Accuracy & Truthfulness:
+               - Provide accurate, helpful answers.
+               - Never hallucinate or make up fake facts. If information is outside your knowledge, be completely transparent.
+            4. Detail Level:
+               - $lengthInstruction
+            ${if (customInstructions.isNotBlank()) "5. User's Custom Instructions:\n$customInstructions" else ""}
+        """.trimIndent()
+    }
+
+    private fun formatApiError(code: Int, rawBody: String): String {
+        return when (code) {
+            400 -> "Invalid Request (400): Please check your query or attachments and try again."
+            401, 403 -> "Authentication Error ($code): Please check your API key in Settings."
+            429 -> "Rate Limit Exceeded (429): You have sent too many requests. Please wait a moment and try again."
+            500, 503 -> "Server Unavailable ($code): The AI provider is temporarily busy. Please try again shortly."
+            else -> "Error ($code): An issue occurred while contacting Rima AI. Please retry."
+        }
+    }
+
+    private fun generateOfflineFallback(prompt: String, lang: DetectedLanguage): String {
+        return when (lang) {
+            DetectedLanguage.BENGALI -> """
+                ## রিমা এআই (Rima AI) এ স্বাগতম!
+                
+                আমি আপনার ব্যক্তিগত এআই সহকারী। আমি সাধারণ জ্ঞান, বিজ্ঞান, প্রোগ্রামিং, অনুবাদ, গণিত এবং দৈনন্দিন যেকোনো প্রশ্নের উত্তর দিতে প্রস্তুত।
+                
+                **আপনার প্রশ্ন:**
+                > "$prompt"
+                
+                *নোট: সরাসরি লাইভ এআই সার্ভার অ্যাক্সেস করতে অনুগ্রহ করে Settings থেকে একটি সক্রিয় Gemini API Key যুক্ত করুন অথবা AI Studio Secrets সক্রিয় করুন।*
+            """.trimIndent()
+            DetectedLanguage.BANGLISH -> """
+                ## Rima AI te shagotom!
+                
+                Ami apnar intelligent AI assistant. Apnar proshno:
+                > "$prompt"
+                
+                Ami Bangla, English ebong Banglish shob language e help korte pari!
+                
+                *Note: Live AI server call korar jonno Settings theke Gemini API Key check korun.*
+            """.trimIndent()
+            DetectedLanguage.ENGLISH -> """
+                ## Welcome to Rima AI!
+                
+                I am Rima AI, your intelligent assistant.
+                
+                **Your query:**
+                > "$prompt"
+                
+                I am ready to help you with:
+                - **General Knowledge & Science**
+                - **Coding & Technical Problem Solving**
+                - **Multilingual Translations (Bengali / English)**
+                - **Math & Step-by-Step Explanations**
+                
+                *Tip: Set your Gemini API Key in Settings or AI Studio Secrets to enable live real-time model answers.*
+            """.trimIndent()
+        }
+    }
+
+    private fun encodeUriToBase64(uri: Uri): String? {
+        return try {
+            val inputStream: InputStream? = context.contentResolver.openInputStream(uri)
+            val bitmap = BitmapFactory.decodeStream(inputStream)
+            inputStream?.close()
+
+            if (bitmap != null) {
+                val outputStream = ByteArrayOutputStream()
+                // Resize if oversized to preserve memory and speed
+                val maxDim = 1024
+                val scale = if (bitmap.width > maxDim || bitmap.height > maxDim) {
+                    val maxOriginal = maxOf(bitmap.width, bitmap.height)
+                    maxDim.toFloat() / maxOriginal
+                } else 1.0f
+
+                val scaledBitmap = if (scale < 1.0f) {
+                    Bitmap.createScaledBitmap(
+                        bitmap,
+                        (bitmap.width * scale).toInt(),
+                        (bitmap.height * scale).toInt(),
+                        true
+                    )
+                } else bitmap
+
+                scaledBitmap.compress(Bitmap.CompressFormat.JPEG, 85, outputStream)
+                val byteArray = outputStream.toByteArray()
+                Base64.encodeToString(byteArray, Base64.NO_WRAP)
+            } else {
+                null
+            }
+        } catch (e: Exception) {
+            e.printStackTrace()
+            null
+        }
+    }
+}
