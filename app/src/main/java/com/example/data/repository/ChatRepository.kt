@@ -15,6 +15,7 @@ import com.example.data.model.SettingsManager
 import com.example.data.remote.CandidateDto
 import com.example.data.remote.ContentDto
 import com.example.data.remote.GeminiApiClient
+import com.example.data.remote.GeminiErrorResponse
 import com.example.data.remote.GenerateContentRequest
 import com.example.data.remote.GenerationConfigDto
 import com.example.data.remote.InlineDataDto
@@ -103,7 +104,8 @@ class ChatRepository(
         val apiKey = settings.customApiKey.ifBlank { BuildConfig.GEMINI_API_KEY }
 
         // 1. Detect language of the input
-        val detectedLang = LanguageDetectorUtil.detectLanguage(userPrompt)
+        val cleanPrompt = userPrompt.trim()
+        val detectedLang = LanguageDetectorUtil.detectLanguage(if (cleanPrompt.isNotBlank()) cleanPrompt else "Hello")
         val langCode = when (detectedLang) {
             DetectedLanguage.BENGALI -> "bn"
             DetectedLanguage.BANGLISH -> "banglish"
@@ -112,11 +114,21 @@ class ChatRepository(
 
         // 2. Insert User Message into Room
         val userMessageId = UUID.randomUUID().toString()
+        val displayPrompt = if (cleanPrompt.isNotBlank()) {
+            cleanPrompt
+        } else if (imageUri != null) {
+            "Attached Image"
+        } else if (documentName != null) {
+            "Attached File: $documentName"
+        } else {
+            "Hello"
+        }
+
         val userMessage = ChatMessageEntity(
             id = userMessageId,
             conversationId = conversationId,
             role = "user",
-            content = userPrompt,
+            content = displayPrompt,
             imageUri = imageUri?.toString(),
             attachmentName = documentName,
             attachmentType = if (imageUri != null) "image" else if (documentName != null) "document" else null,
@@ -128,38 +140,15 @@ class ChatRepository(
         chatMessageDao.insertMessage(userMessage)
         conversationDao.touchConversation(conversationId)
 
-        // 3. Build Conversation History for multi-turn context (excluding error messages, last 12 turns)
+        // 3. Build Sanitized Conversation History for multi-turn context (strict user/model alternation)
         val historyMessages = chatMessageDao.getMessagesListForConversation(conversationId)
-            .filter { !it.isError || it.id == userMessageId }
-        val contextTurnMessages = if (historyMessages.size > 12) {
-            historyMessages.takeLast(12)
-        } else {
-            historyMessages
-        }
-
-        // Build contents list
-        val contentsList = mutableListOf<ContentDto>()
-        for (msg in contextTurnMessages) {
-            val parts = mutableListOf<PartDto>()
-
-            // If message is the current turn and has image, encode base64
-            if (msg.id == userMessageId && imageUri != null) {
-                val base64Data = encodeUriToBase64(imageUri)
-                if (base64Data != null) {
-                    parts.add(PartDto(inlineData = InlineDataDto(mimeType = "image/jpeg", data = base64Data)))
-                }
-            }
-
-            var textPayload = msg.content
-            if (msg.id == userMessageId && documentContent != null) {
-                textPayload = "Attached File Content (${documentName ?: "document"}):\n\"\"\"\n$documentContent\n\"\"\"\n\nUser Question:\n$textPayload"
-            }
-
-            parts.add(PartDto(text = textPayload))
-
-            val apiRole = if (msg.role == "user") "user" else "model"
-            contentsList.add(ContentDto(role = apiRole, parts = parts))
-        }
+        val contentsList = buildSanitizedContents(
+            history = historyMessages,
+            currentUserMessageId = userMessageId,
+            currentImageUri = imageUri,
+            currentDocumentName = documentName,
+            currentDocumentContent = documentContent
+        )
 
         // 4. Build System Instruction for Rima AI
         val systemInstructionText = buildSystemPrompt(settings.responseLength, settings.customInstructions, detectedLang)
@@ -170,7 +159,6 @@ class ChatRepository(
         val generationConfig = GenerationConfigDto(
             temperature = 0.7f,
             topP = 0.95f,
-            topK = 40,
             maxOutputTokens = when (settings.responseLength) {
                 ResponseLengthMode.SHORT -> 512
                 ResponseLengthMode.NORMAL -> 2048
@@ -228,7 +216,7 @@ class ChatRepository(
                         language = langCode
                     )
                     chatMessageDao.insertMessage(aiMsg)
-                    autoRenameFirstTurn(conversationId, userPrompt)
+                    autoRenameFirstTurn(conversationId, displayPrompt)
                     return@withContext Result.success(aiMsg)
                 } else {
                     val statusCode = response.code()
@@ -282,6 +270,102 @@ class ChatRepository(
         Result.failure(lastException ?: Exception(errorText))
     }
 
+    private fun buildSanitizedContents(
+        history: List<ChatMessageEntity>,
+        currentUserMessageId: String,
+        currentImageUri: Uri?,
+        currentDocumentName: String?,
+        currentDocumentContent: String?
+    ): List<ContentDto> {
+        val validMessages = history.filter { !it.isError || it.id == currentUserMessageId }
+        val turnsToProcess = if (validMessages.size > 11) {
+            validMessages.takeLast(11)
+        } else {
+            validMessages
+        }
+
+        val rawContents = mutableListOf<ContentDto>()
+
+        for (msg in turnsToProcess) {
+            val parts = mutableListOf<PartDto>()
+            val isCurrentTurn = (msg.id == currentUserMessageId)
+
+            if (isCurrentTurn && currentImageUri != null) {
+                val base64Data = encodeUriToBase64(currentImageUri)
+                if (!base64Data.isNullOrBlank()) {
+                    val mimeType = getMimeType(currentImageUri) ?: "image/jpeg"
+                    parts.add(PartDto(inlineData = InlineDataDto(mimeType = mimeType, data = base64Data)))
+                }
+            }
+
+            var textContent = msg.content.trim()
+            if (isCurrentTurn && !currentDocumentContent.isNullOrBlank()) {
+                val docHeader = "Attached Document Content (${currentDocumentName ?: "document"}):\n```\n$currentDocumentContent\n```\n\n"
+                textContent = if (textContent.isNotBlank()) "$docHeader$textContent" else "${docHeader}Please analyze and summarize the attached document."
+            }
+
+            if (textContent.isNotBlank()) {
+                parts.add(PartDto(text = textContent))
+            } else if (parts.isEmpty()) {
+                if (isCurrentTurn && currentImageUri != null) {
+                    parts.add(PartDto(text = "Please analyze this image."))
+                } else {
+                    parts.add(PartDto(text = "Hello"))
+                }
+            }
+
+            if (parts.isNotEmpty()) {
+                val role = if (msg.role == "user") "user" else "model"
+                rawContents.add(ContentDto(role = role, parts = parts))
+            }
+        }
+
+        // Strict alternating validation:
+        // Must alternate user -> model -> user -> model -> user
+        val alternatingList = mutableListOf<ContentDto>()
+        for (item in rawContents) {
+            if (alternatingList.isEmpty()) {
+                if (item.role == "user") {
+                    alternatingList.add(item)
+                }
+            } else {
+                val lastRole = alternatingList.last().role
+                if (item.role != lastRole) {
+                    alternatingList.add(item)
+                } else {
+                    // Collapse duplicate consecutive role by keeping the latest turn
+                    if (item.role == "user") {
+                        alternatingList[alternatingList.lastIndex] = item
+                    }
+                }
+            }
+        }
+
+        // Must end with user role
+        if (alternatingList.isEmpty() || alternatingList.last().role != "user") {
+            val fallbackParts = mutableListOf<PartDto>()
+            if (currentImageUri != null) {
+                val base64 = encodeUriToBase64(currentImageUri)
+                if (!base64.isNullOrBlank()) {
+                    fallbackParts.add(PartDto(inlineData = InlineDataDto(mimeType = getMimeType(currentImageUri) ?: "image/jpeg", data = base64)))
+                }
+            }
+            val latestUserMsg = history.lastOrNull { it.id == currentUserMessageId }?.content?.trim()?.ifBlank { "Hello" } ?: "Hello"
+            fallbackParts.add(PartDto(text = latestUserMsg))
+            return listOf(ContentDto(role = "user", parts = fallbackParts))
+        }
+
+        return alternatingList
+    }
+
+    private fun getMimeType(uri: Uri): String? {
+        return try {
+            context.contentResolver.getType(uri) ?: "image/jpeg"
+        } catch (e: Exception) {
+            "image/jpeg"
+        }
+    }
+
     private suspend fun autoRenameFirstTurn(conversationId: String, userPrompt: String) {
         val conv = conversationDao.getConversationById(conversationId)
         if (conv != null && (conv.title == "New Chat" || conv.title.isBlank())) {
@@ -331,12 +415,25 @@ class ChatRepository(
     }
 
     private fun formatApiError(code: Int, rawBody: String): String {
+        val parsedMsg = try {
+            val adapter = GeminiApiClient.moshi.adapter(GeminiErrorResponse::class.java)
+            adapter.fromJson(rawBody)?.error?.message
+        } catch (e: Exception) {
+            null
+        }
+
+        val detail = if (!parsedMsg.isNullOrBlank()) {
+            "\nDetails: $parsedMsg"
+        } else if (rawBody.isNotBlank()) {
+            "\nDetails: $rawBody"
+        } else ""
+
         return when (code) {
-            400 -> "Invalid Request (400): Please check your query or attachments and try again."
-            401, 403 -> "Authentication Error ($code): Please check your API key in Settings or AI Studio Secrets."
-            429 -> "Rate Limit Exceeded (429): You have sent too many requests. Please wait a moment and try again."
-            500, 503 -> "Server Unavailable ($code): The AI provider is temporarily busy. Please try again shortly."
-            else -> "Error ($code): An issue occurred while contacting Rima AI. Please retry."
+            400 -> "Invalid Request (400): $detail"
+            401, 403 -> "Authentication Error ($code): Please verify your Gemini API key in Settings or AI Studio Secrets.$detail"
+            429 -> "Rate Limit Exceeded (429): You have sent too many requests. Please wait a moment and try again.$detail"
+            500, 503 -> "Server Unavailable ($code): The AI provider is temporarily busy. Please try again shortly.$detail"
+            else -> "Error ($code): An issue occurred while contacting Rima AI.$detail"
         }
     }
 

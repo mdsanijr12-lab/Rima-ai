@@ -43,7 +43,7 @@ object GeminiApiClient {
 
     private val okHttpClient: OkHttpClient by lazy {
         val logging = HttpLoggingInterceptor().apply {
-            level = HttpLoggingInterceptor.Level.BASIC
+            level = HttpLoggingInterceptor.Level.BODY
         }
         OkHttpClient.Builder()
             .connectTimeout(60, TimeUnit.SECONDS)

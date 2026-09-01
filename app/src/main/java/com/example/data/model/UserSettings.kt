@@ -28,21 +28,21 @@ data class AIModelOption(
 
 object AvailableModels {
     val RIMA_FLASH = AIModelOption(
-        id = "gemini-3.5-flash",
+        id = "gemini-2.5-flash",
         name = "Rima Flash",
         description = "Lightning-fast answers for everyday questions, math, translation & coding.",
         badge = "Fast & Smart",
         supportsVision = true
     )
     val RIMA_PRO = AIModelOption(
-        id = "gemini-3.1-pro-preview",
+        id = "gemini-2.5-pro",
         name = "Rima Pro",
         description = "Advanced reasoning, complex problem solving, in-depth academic explanations.",
         badge = "High Intelligence",
         supportsVision = true
     )
     val RIMA_CREATIVE = AIModelOption(
-        id = "gemini-2.5-flash-image",
+        id = "gemini-2.5-flash",
         name = "Rima Vision & Creative",
         description = "Deep image analysis, document scanning, creative writing and idea generation.",
         badge = "Vision & Art",
@@ -52,7 +52,11 @@ object AvailableModels {
     val list = listOf(RIMA_FLASH, RIMA_PRO, RIMA_CREATIVE)
 
     fun find(id: String): AIModelOption {
-        return list.firstOrNull { it.id == id } ?: RIMA_FLASH
+        return list.firstOrNull { it.id == id }
+            ?: when {
+                id.contains("pro", ignoreCase = true) -> RIMA_PRO
+                else -> RIMA_FLASH
+            }
     }
 }
 

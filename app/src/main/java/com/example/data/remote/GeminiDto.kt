@@ -57,6 +57,11 @@ data class ContentResponseDto(
 )
 
 @JsonClass(generateAdapter = true)
+data class GeminiErrorResponse(
+    @Json(name = "error") val error: GeminiErrorDto? = null
+)
+
+@JsonClass(generateAdapter = true)
 data class GeminiErrorDto(
     @Json(name = "code") val code: Int? = null,
     @Json(name = "message") val message: String? = null,
